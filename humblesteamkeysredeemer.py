@@ -1,4 +1,6 @@
 import requests
+from requests_futures.sessions import FuturesSession
+from concurrent.futures import as_completed
 from fuzzywuzzy import fuzz
 import steam.webauth as wa
 import time
@@ -281,7 +283,14 @@ def _redeem_steam(session, key, quiet=False):
             print("Redeemed " + item["line_item_description"])
         return 0
     else:
-        error_code = blob["purchase_result_details"]
+        error_code = blob.get("purchase_result_details")
+        if error_code == None:
+            # Sometimes purchase_result_details isn't there for some reason, try alt method
+            error_code = blob.get("purchase_receipt_info")
+            if error_code != None:
+                error_code = error_code.get("result_detail")
+        error_code = error_code or 53
+
         if error_code == 14:
             error_message = (
                 "The product code you've entered is not valid. Please double check to see if you've "
@@ -352,16 +361,19 @@ def write_key(code, key):
         filename = "errored.csv"
 
     if filename not in files:
-        files[filename] = open(filename, "a")
+        files[filename] = open(filename, "a", encoding="utf-8-sig")
     key["human_name"] = key["human_name"].replace(",", ".")
-    output = "{gamekey},{human_name},{redeemed_key_val}\n".format(**key)
+    gamekey = key.get('gamekey')
+    human_name = key.get("human_name")
+    redeemed_key_val = key.get("redeemed_key_val")
+    output = f"{gamekey},{human_name},{redeemed_key_val}\n"
     files[filename].write(output)
     files[filename].flush()
 
 
 def prompt_skipped(skipped_games):
     user_filtered = []
-    with open("skipped.txt", "w") as file:
+    with open("skipped.txt", "w", encoding="utf-8-sig") as file:
         for skipped_game in skipped_games.keys():
             file.write(skipped_game + "\n")
 
@@ -377,7 +389,7 @@ def prompt_skipped(skipped_games):
     except SyntaxError:
         pass
     if os.path.exists("skipped.txt"):
-        with open("skipped.txt", "r") as file:
+        with open("skipped.txt", "r", encoding="utf-8-sig") as file:
             user_filtered = [line.strip() for line in file]
         os.remove("skipped.txt")
     # Choose only the games that appear to be missing from user's skipped.txt file
@@ -576,13 +588,13 @@ def export_mode(humble_session,order_details):
     
     ts = time.strftime("%Y%m%d-%H%M%S")
     filename = f"humble_export_{ts}.csv"
-    with open(filename,'w') as f:
+    with open(filename, 'w', encoding="utf-8-sig") as f:
         f.write(','.join(export_key_headers)+"\n")
         for key in keys:
             row = []
             for col in export_key_headers:
                 if col in key:
-                    row.append(str(key[col]))
+                    row.append("\"" + str(key[col]) + "\"")
                 else:
                     row.append("")
             f.write(','.join(row)+"\n")
@@ -728,11 +740,15 @@ print("Successfully signed in on Humble.")
 orders = humble_session.get(HUMBLE_ORDERS_API).json()
 print(f"Getting {len(orders)} order details, please wait")
 
-# TODO: multithread this
-order_details = [
-    humble_session.get(f"{HUMBLE_ORDER_DETAILS_API}{order['gamekey']}?all_tpkds=true").json()
-    for order in orders
-]
+order_details = []
+with FuturesSession(session=humble_session,max_workers=30) as retriever:
+    order_futures = [
+        retriever.get(f"{HUMBLE_ORDER_DETAILS_API}{order['gamekey']}?all_tpkds=true")
+        for order in orders
+    ]
+    for future in as_completed(order_futures):
+        resp = future.result()
+        order_details.append(resp.json())
 
 desired_mode = prompt_mode(order_details,humble_session)
 if(desired_mode == "2"):
